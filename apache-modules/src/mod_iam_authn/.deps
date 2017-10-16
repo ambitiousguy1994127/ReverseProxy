@@ -1,0 +1,20 @@
+
+curl_recv_data.o :
+
+debug_request.o :
+
+str_utils.o :
+
+parse_soap_str.o : \
+	str_utils.o
+
+parse_soap_xml.o : \
+	str_utils.o
+
+mod_iam_authn.o : \
+	fetch_utils.o \
+	curl_recv_data.o \
+	debug_request.o \
+	parse_soap_str.o \
+	parse_soap_xml.o
+

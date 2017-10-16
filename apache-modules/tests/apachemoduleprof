@@ -1,0 +1,140 @@
+#!/bin/sh
+#
+# Program: Apache DTrace Module Profiler <apachemoduleprof>
+#
+# Author:  Matty <matty91 at gmail dot com>
+#
+# Current Version: 0.1a
+#
+# Revision History:
+#  Version 0.1a
+#
+# Last Updated: 12-09-2005
+#
+# Purpose: Prints the modules and functions involved in request processing.
+#
+# Installation:
+#   Copy the shell script to a suitable location
+#
+# Issues:
+#   -- currently doesn't capture ap_process_http_connection() function timings
+#
+# CDDL HEADER START
+#  The contents of this file are subject to the terms of the
+#  Common Development and Distribution License, Version 1.0 only
+#  (the "License").  You may not use this file except in compliance
+#  with the License.
+#
+#  You can obtain a copy of the license at Docs/cddl1.txt
+#  or http://www.opensolaris.org/os/licensing.
+#  See the License for the specific language governing permissions
+#  and limitations under the License.
+# CDDL HEADER END
+
+
+# need https://github.com/dtrace4linux/linux.git
+
+if [ $# -ne 1 ]
+then
+    echo "Usage: $0 PID"
+    echo "apachemoduleprof `pgrep httpd`"
+    exit 1
+fi 
+
+/usr/sbin/dtrace -p $1 -q -32 -n'
+
+dtrace:::BEGIN
+{    
+    printf("Started Apache Request Profiler (Control-C to stop...)\n\n");
+}
+
+pid$target::ap_run_create_connection:entry
+{
+    /*
+      This is called almost immediately after the accept(), so we can
+      initialize total_time and set connection_start to be the walltimestamp
+    */
+   
+    self->total_time = 0;
+    self->connection_start = walltimestamp;
+}
+
+pid$target::ap_run_log_transaction:entry
+{
+    /* Grab the method and URI for the final output */
+    self->method = copyinstr(*(uintptr_t *)copyin(arg0 + 72,sizeof(uintptr_t)));
+    self->uri = copyinstr(*(uintptr_t *)copyin(arg0 + 200, sizeof(uintptr_t)));
+
+    @requests[self->method,self->uri] = count();
+}
+
+pid$target::ap_run_*:entry
+{
+    /* 
+       This probe will fire when we enter the hook function. The next 
+       function called should be the first function in the pHooks 
+       function array. To ensure that this entry/exit gets recorded, 
+       we set the function_print value to 1, and stash the hook name
+      away for later use.
+    */
+    self->function_print=1;
+    self->hook_name = probefunc;
+}
+
+pid$target::ap_run_*:return
+{
+    self->function_print=0;
+}
+
+pid$target:::entry
+/self->function_print && probefunc != self->hook_name /
+{
+    /*
+       If we are getting invoked from pHooks[X]->pFunc(c,csd), then we
+       need to stop children we call from printing.
+    */
+    self->function_print = 0;
+    self->function_name = probefunc;
+    self->hook_timestamp = timestamp;
+}
+
+pid$target:::return
+/probefunc == self->function_name && probefunc != self->hook_name/
+{
+    /* 
+       Grab the time differences for probemod and increase the
+       total processing time.
+    */
+    this->tdiff =  timestamp - self->hook_timestamp;
+    self->total_time += this->tdiff;
+    @modules[probemod] = sum(this->tdiff);
+    @hooks[self->hook_name,probemod,probefunc] = sum(this->tdiff);
+
+    /*
+       If we matched based on "function_name," we should set 
+       self->function_print to 1 to allow the next function in
+       pHooks to print.
+    */
+    self->function_print = 1;
+}
+
+pid$target::ap_run_process_connection:return
+{
+    printf("\n              *** New connection ***\n\n");
+    printf("Connection start: %Y\n", self->connection_start);
+    printf("Connection stop : %Y\n\n", walltimestamp);
+
+    printf("%-10s  %-40s  %s\n", "Method", "URI","Count");
+    printa("%-10s  %-40s  %@d\n", @requests);
+
+    printf("\n%-20s  %20s\n","Module", "Processing Time");
+    printa("%-20s  %15@d ns\n",@modules);
+    printf("%-20s  %15d ms\n\n","Total", self->total_time / 1000000);
+
+    printf("%-28s  %-16s  %-30s  %-5s\n","Hook Name", "Module", "Hook Function", "Time");
+    printa("%-28s  %-16s  %-30s  %-@d ns\n",@hooks);
+
+    trunc(@hooks);
+    trunc(@modules);
+    trunc(@requests);
+}'
